@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     model_config = {"env_prefix": "DASHSCOPE_PROXY_", "case_sensitive": False}
 
     # --- DashScope ---
-    base_http_api_url: str = ""
+    base_http_api_url: str = "https://dashscope.aliyuncs.com/api/v1"
     """DashScope base URL: ``https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1``."""
 
     # --- Model ---
