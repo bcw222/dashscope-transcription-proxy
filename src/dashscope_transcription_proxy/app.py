@@ -17,21 +17,30 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import PlainTextResponse, Response
 
 from .client import TranscriptionClient
+from .local_client import VLLMTranscriptionClient
 from .models import SUPPORTED_RESPONSE_FORMATS, build_response
 from .settings import get_settings
 
 logger = logging.getLogger("dashscope-transcription-proxy")
 
 
-def _get_client() -> TranscriptionClient:
-    """Create the singleton client lazily (settings are read on first use)."""
-    return TranscriptionClient(get_settings())
+def _get_client() -> Any:
+    """Create the singleton client lazily (settings are read on first use).
+
+    Backend is chosen by ``DASHSCOPE_PROXY_BACKEND`` (``dashscope`` | ``vllm``).
+    Both clients expose the same ``start``/``stop``/``transcribe`` contract and
+    return the same raw-dict shape, so nothing downstream needs to branch.
+    """
+    s = get_settings()
+    if s.backend.strip().lower() == "vllm":
+        return VLLMTranscriptionClient(s)
+    return TranscriptionClient(s)
 
 
-_client: TranscriptionClient | None = None
+_client: Any = None
 
 
-def _client_or_init() -> TranscriptionClient:
+def _client_or_init() -> Any:
     global _client
     if _client is None:
         _client = _get_client()
@@ -42,7 +51,7 @@ def _client_or_init() -> TranscriptionClient:
 async def lifespan(app: FastAPI):
     client = _client_or_init()
     s = get_settings()
-    logger.info("Starting (model=%s local_mode=%s) …", s.model, s.local_mode)
+    logger.info("Starting (backend=%s model=%s local_mode=%s) …", s.backend, s.model, s.local_mode)
     await client.start()
     yield
     await client.stop()
@@ -56,7 +65,10 @@ app = FastAPI(title="DashScope Transcription Proxy", version="0.1.0", lifespan=l
 # POST /audio/transcriptions
 # ---------------------------------------------------------------------------
 
+# ``/v1/...`` alias: OpenAI SDK clients default to a ``/v1`` prefix, while some
+# downstreams (e.g. Open WebUI) take a bare base URL. Serve both.
 @app.post("/audio/transcriptions")
+@app.post("/v1/audio/transcriptions")
 async def transcribe(
     request: Request,
     # multipart fields
@@ -76,8 +88,9 @@ async def transcribe(
     if stream:
         raise HTTPException(501, "Streaming is not supported")
 
+    s = get_settings()
     api_key = _extract_api_key(request)
-    if not api_key:
+    if not api_key and s.require_downstream_key:
         raise HTTPException(401, "Missing Authorization: Bearer <key> header")
 
     content_type: str = request.headers.get("content-type", "")
@@ -104,7 +117,17 @@ async def transcribe(
 @app.get("/health")
 async def health():
     s = get_settings()
-    return {"status": "ok", "model": s.model, "local_mode": s.local_mode}
+    body: dict[str, Any] = {
+        "status": "ok",
+        "model": s.model,
+        "local_mode": s.local_mode,
+        "backend": s.backend,
+    }
+    if s.backend.strip().lower() == "vllm":
+        # On the local backend the effective model is vllm_model, not the DashScope id.
+        body["model"] = s.vllm_model
+        body["vllm_base_url"] = s.vllm_base_url
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +220,16 @@ async def _do_transcribe(
 
     if fmt not in SUPPORTED_RESPONSE_FORMATS:
         raise HTTPException(400, f"Unsupported response_format: {fmt}")
+
+    # srt/vtt need word-level timestamps; the local vLLM chat surface has none.
+    # Fail loudly rather than returning an empty subtitle file.
+    if fmt in ("srt", "vtt") and s.backend.strip().lower() == "vllm":
+        raise HTTPException(
+            400,
+            "response_format=srt/vtt requires word-level timestamps, which the local "
+            "vLLM backend does not provide. Use json/text/verbose_json, or set "
+            "DASHSCOPE_PROXY_BACKEND=dashscope.",
+        )
 
     if s.local_mode:
         response = _mock_result(fmt)

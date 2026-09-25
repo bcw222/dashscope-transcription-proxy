@@ -1,6 +1,7 @@
 # DashScope Transcription Proxy
 
-将 [阿里云百炼 DashScope](https://help.aliyun.com/zh/model-studio/)（Aliyun Bailian） 语音识别包装为  
+将 [阿里云百炼 DashScope](https://help.aliyun.com/zh/model-studio/)（Aliyun Bailian）语音识别，
+或**本地自建的 Qwen3-ASR 服务**（`backend=vllm`，见下文），包装为  
 **OpenAI-compatible `POST /audio/transcriptions`** 代理，可直接替换 Open WebUI
 等下游的 OpenAI STT 后端。
 
@@ -64,12 +65,78 @@ curl http://localhost:8000/audio/transcriptions \
 | `LOG_LEVEL` | `info` | 日志级别 |
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `PORT` | `8000` | 监听端口 |
+| `DASHSCOPE_PROXY_BACKEND` | `dashscope` | `dashscope`（云端）或 `vllm`（本地 Qwen3-ASR） |
+| `DASHSCOPE_PROXY_REQUIRE_DOWNSTREAM_KEY` | `true` | 是否强制下游带 `Authorization`；纯内网本地部署可设 `false` |
+| `DASHSCOPE_PROXY_VLLM_BASE_URL` | `http://127.0.0.1:8001/v1` | 本地 ASR 服务的 OpenAI 兼容 base URL |
+| `DASHSCOPE_PROXY_VLLM_API_KEY` | — | 本地服务的 `--api-key`；留空则不带认证头 |
+| `DASHSCOPE_PROXY_VLLM_MODEL` | `qwen3-asr` | 本地服务的 `--served-model-name`；**下游传的 `model` 会被忽略** |
+| `DASHSCOPE_PROXY_VLLM_TIMEOUT` | `600` | 单请求超时（秒），长音频要给足 |
+| `DASHSCOPE_PROXY_VLLM_MAX_TOKENS` | `4096` | 补全上限，长音频调大 |
+| `DASHSCOPE_PROXY_VLLM_PASSTHROUGH_CONTEXT` | `true` | 把下游 `prompt` 作为 system message 传下去（热词/上下文） |
+| `DASHSCOPE_PROXY_QWEN_OUTPUT_PARSER` | `auto` | Qwen3-ASR 原始输出拆分方式：`auto`/`official`/`none` |
+
+## 本地后端（`backend=vllm`）—— 离线 Qwen3-ASR
+
+除了转发到百炼云端，本代理还能把请求打到**本地自建的 Qwen3-ASR 服务**
+（官方 `qwen-asr-serve`，即 `vllm serve` 的包装，暴露 OpenAI 兼容的
+`POST /v1/chat/completions` + `audio_url`）。下游（Open WebUI 等）仍然只看到
+一个标准的 `/v1/audio/transcriptions`，而推理跑在你自己的 GPU 上：
+**零 API 费用、可完全离线**。
+
+```bash
+DASHSCOPE_PROXY_BACKEND=vllm \
+DASHSCOPE_PROXY_VLLM_BASE_URL=http://asr:8000/v1 \
+DASHSCOPE_PROXY_VLLM_MODEL=qwen3-asr \
+DASHSCOPE_PROXY_REQUIRE_DOWNSTREAM_KEY=false \
+python -m dashscope_transcription_proxy
+```
+
+### 与云端后端的能力差异
+
+| 能力 | `dashscope` | `vllm`（本地） |
+|---|---|---|
+| `json` / `text` / `verbose_json` | ✅ | ✅ |
+| `srt` / `vtt` | ✅（字级时间戳） | ❌ **返回 400** —— vLLM 的 chat 面不返回字级时间戳 |
+| `verbose_json` 的 `words[]` | ✅ | 恒为空 |
+| `verbose_json` 的 `language` | ✅ | ✅（从模型输出解析） |
+| `usage` | 音频秒数 | token 计数（本地无音频秒数） |
+| 强制 `language` | ✅ | ❌ 忽略，模型自动检测 |
+| 下游 `model` 字段 | ✅ 透传 | ❌ 忽略，恒用 `VLLM_MODEL` |
+| `prompt`（热词/上下文） | ✅ | ✅ 作为 system message |
+
+**故意失败而非静默降级**：本地后端收到 `response_format=srt|vtt` 会返回 400
+并说明原因，而不是回一个空字幕文件。
+
+### Qwen3-ASR 输出解析（唯一需要你现场确认的点）
+
+vLLM 返回的 `choices[0].message.content` 是 Qwen3-ASR 的**原始输出**，其中可能带
+语种标记。官方解析函数是 `qwen_asr.parse_asr_output(content) -> (language, text)`。
+本代理按 `QWEN_OUTPUT_PARSER` 处理：
+
+- `auto`（默认）：能 import 到官方 `qwen_asr` 就用它；否则走**保守启发式**
+  （只剥离开头的 `<|…|>` 特殊标记、或显式的 `language: X` 前缀）；再否则原样返回
+- `official`：强制用官方解析器（代理容器里没装 `qwen-asr` 就直接报错）
+- `none`：完全原样返回
+
+启发式**故意做得很钝** —— 猜错会静默污染转写文本，所以拿不准就不动。
+**部署后请先用一条真实录音看 `response_format=verbose_json` 的 `text` 与 `language`
+是否干净**；若发现残留标记，把 `QWEN_OUTPUT_PARSER` 定为 `official` 并在代理镜像里
+装上 `qwen-asr`。
+
+### 与本地 ASR 服务的编排
+
+配套的 `qwen3-asr-serving` 交付物里 `compose.yaml` 已把两者编排好：`asr`（GPU 推理）
++ `proxy`（本代理）同网络，proxy 的 `VLLM_BASE_URL=http://asr:8000/v1`，
+**对外只暴露 proxy**。
 
 ## API
 
 ### `POST /audio/transcriptions`
 
-兼容 OpenAI `/audio/transcriptions`。支持：
+兼容 OpenAI `/audio/transcriptions`。**同时挂载了 `POST /v1/audio/transcriptions` 别名** ——
+OpenAI SDK 默认带 `/v1` 前缀，而部分下游（如 Open WebUI）填裸 base URL，两种都能用。
+
+支持：
 
 **multipart/form-data：**
 
