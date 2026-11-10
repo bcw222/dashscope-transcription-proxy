@@ -74,6 +74,18 @@ curl http://localhost:8000/audio/transcriptions \
 | `DASHSCOPE_PROXY_VLLM_MAX_TOKENS` | `4096` | 补全上限，长音频调大 |
 | `DASHSCOPE_PROXY_VLLM_PASSTHROUGH_CONTEXT` | `true` | 把下游 `prompt` 作为 system message 传下去（热词/上下文） |
 | `DASHSCOPE_PROXY_QWEN_OUTPUT_PARSER` | `auto` | Qwen3-ASR 原始输出拆分方式：`auto`/`official`/`none` |
+| `DASHSCOPE_PROXY_REALTIME_ENABLED` | `true` | 是否提供流式 WebSocket 端点 |
+| `DASHSCOPE_PROXY_REALTIME_MODEL` | `qwen3-asr-flash-realtime` | 默认实时模型 |
+| `DASHSCOPE_PROXY_REALTIME_WS_URL` | — | 上游 WS 地址；留空则由 `BASE_HTTP_API_URL` 推导（`/api/v1` → `/api-ws/v1/realtime`） |
+| `DASHSCOPE_PROXY_REALTIME_SAMPLE_RATE` | `16000` | 上游采样率，`16000` 或 `8000`（电话/听写场景用 8000） |
+| `DASHSCOPE_PROXY_REALTIME_INPUT_FORMAT` | `pcm16` | 下游送入的音频格式：`pcm16`/`g711_ulaw`/`g711_alaw` |
+| `DASHSCOPE_PROXY_REALTIME_LANGUAGE` | — | 语种提示（`zh`/`en`/`yue`…），留空交给模型判断 |
+| `DASHSCOPE_PROXY_REALTIME_VAD` | `true` | `true`=服务端 VAD 自动断句；`false`=Manual 模式（由下游 commit） |
+| `DASHSCOPE_PROXY_REALTIME_VAD_THRESHOLD` | `0.0` | VAD 触发阈值 `[-1,1]` |
+| `DASHSCOPE_PROXY_REALTIME_SILENCE_DURATION_MS` | `400` | VAD 断句静音时长 `[200,6000]` ms |
+| `DASHSCOPE_PROXY_REALTIME_FINISH_TIMEOUT` | `5.0` | 发 `session.finish` 后等 `session.finished` 的上限（秒） |
+| `DASHSCOPE_PROXY_REALTIME_USE_ENV_PROXY` | `true` | 上游 WS 是否沿用 `HTTPS_PROXY`/`HTTP_PROXY`；上游在本机/内网或代理不通时设 `false` |
+| `DASHSCOPE_PROXY_REALTIME_PROXY_URL` | — | 显式指定上游 WS 代理，优先级高于上一项 |
 
 ## 本地后端（`backend=vllm`）—— 离线 Qwen3-ASR
 
@@ -172,13 +184,57 @@ curl http://localhost:8000/audio/transcriptions \
 | `srt` | SubRip 字幕（需字级时间戳） | `application/x-subrip` |
 | `vtt` | WebVTT 字幕（需字级时间戳） | `text/vtt` |
 
-> 不支持的值返回 400；`stream=true` 返回 501（暂不支持流式）。
+> 不支持的值返回 400；`stream=true` 返回 501 —— 流式转写请走下面的 WebSocket 端点。
 
 ### `GET /health`
 
 ```json
 {"status": "ok", "model": "qwen3-asr-flash", "local_mode": false}
 ```
+
+### `WS /v1/realtime`（实时流式转写）
+
+把 DashScope 的 **Qwen-ASR-Realtime**（WebSocket）包装成 **OpenAI Realtime 转写方言**，
+供需要「边说边出字」的下游使用（如 OpenClaw 的听写/Talk 中继）。同时挂载 `/realtime` 别名。
+
+上游模型：`qwen3-asr-flash-realtime`（可用 `?model=` 或 `session.update` 覆盖）。
+认证同 HTTP 端点：**透传** `Authorization: Bearer <dashscope-key>`；
+浏览器无法设置 WebSocket 请求头，因此也支持 `?api_key=***` 查询参数。
+
+```bash
+# websocat 手测：发送 PCM16 16kHz 单声道 base64 块
+websocat "ws://127.0.0.1:8000/v1/realtime?model=qwen3-asr-flash-realtime" \
+  -H "Authorization: Bearer ***"
+```
+
+#### 事件映射
+
+| 方向 | 下游（OpenAI Realtime 方言） | 上游（DashScope Qwen-ASR-Realtime） |
+|------|------------------------------|--------------------------------------|
+| → | `session.update` | `session.update`（补 `event_id`，翻译 `turn_detection`/`language`） |
+| → | `input_audio_buffer.append` | `input_audio_buffer.append`（G.711 → PCM16 后 base64） |
+| → | `input_audio_buffer.commit` | `input_audio_buffer.commit`（Manual 模式） |
+| → | `session.finish` / `session.close` / 断开 | `session.finish` |
+| ← | `session.created` / `session.updated` | 同名（附本代理的音频契约字段） |
+| ← | `input_audio_buffer.speech_started` / `.speech_stopped` / `.committed` | 同名透传 |
+| ← | `conversation.item.input_audio_transcription.delta` | `…transcription.text`（`text`+`stash` → 增量 `delta`） |
+| ← | `…transcription.completed` / `.failed` | 同名透传 |
+| ← | `session.finished` / `error` | 同名透传 |
+
+两个关键行为：
+
+1. **partial 语义重塑**：DashScope 的实时事件给的是「已确认前缀 `text` + 可修订草稿 `stash`」，
+   而 OpenAI 客户端期望增量 `delta`。本代理按 `item_id` 跟踪累计前缀，只把新增尾部作为 `delta` 下发；
+   同时额外附带 `text`（累计全文）与 `revised`（本轮是否发生回改）两个**非标准字段**，
+   便于客户端在模型回改时精确对齐。最终结果以 `completed.transcript` 为准。
+2. **`session.finish` 不可省**：DashScope 在未收到该事件就断连时会丢弃 in-progress item，
+   最终识别结果不会下发。因此下游**主动断开**时，本代理也会补发 `session.finish`，
+   并在 `REALTIME_FINISH_TIMEOUT` 内等待 `session.finished`。
+
+音频格式：下游可送 `pcm16`（默认）或 `g711_ulaw` / `g711_alaw`（别名 `mulaw`/`alaw`/`ulaw`）。
+G.711 会在代理内解码为 PCM16 再上行；采样率支持 `16000` 与 `8000`
+（电话线路、OpenClaw 听写中继均为 8 kHz µ-law，设 `8000` 即可，DashScope 内部升采样）。
+裸二进制帧（无事件封装）也会被当作音频处理。
 
 ## Docker
 
@@ -222,6 +278,42 @@ DASHSCOPE_PROXY_LOCAL_MODE=true python -m dashscope_transcription_proxy
 - **API Base URL**: `http://your-host:8000`
 - **API Key**: 你的 DashScope API Key（`sk-xxx`），代理会透传至百炼
 - **STT Model**: `qwen3-asr-flash`
+
+## 下游配置示例（OpenClaw 听写 / Talk 中继）
+
+OpenClaw 的输入框听写走**流式**转写 provider（`registerRealtimeTranscriptionProvider`），
+内置只有 Deepgram / ElevenLabs / Mistral / OpenAI / xAI 五家。接本代理需要一个极小的本地插件
+把 provider 指向 `ws://your-host:8000/v1/realtime`，并在 `plugins.entries.voice-call.config.streaming`
+下声明：
+
+```json5
+{
+  plugins: {
+    entries: {
+      "voice-call": {
+        config: {
+          streaming: {
+            provider: "dashscope",
+            providers: {
+              dashscope: {
+                url: "ws://127.0.0.1:8000/v1/realtime",
+                model: "qwen3-asr-flash-realtime",
+                inputFormat: "g711_ulaw",   // OpenClaw 听写中继送 8 kHz µ-law
+                sampleRate: 8000,
+                language: "zh",
+                // apiKey 留空则回退读环境变量 DASHSCOPE_API_KEY
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+}
+```
+
+> 仅需「语音消息转写」（一次性音频附件）的场景不必用流式端点：
+> OpenClaw 的 `tools.media.audio` 批量管线直接指向 `POST /v1/audio/transcriptions` 即可。
 
 ## 许可证
 

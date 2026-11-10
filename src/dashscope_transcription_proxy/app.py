@@ -19,6 +19,7 @@ from fastapi.responses import PlainTextResponse, Response
 from .client import TranscriptionClient
 from .local_client import VLLMTranscriptionClient
 from .models import SUPPORTED_RESPONSE_FORMATS, build_response
+from .realtime import derive_realtime_ws_url, router as realtime_router
 from .settings import get_settings
 
 logger = logging.getLogger("dashscope-transcription-proxy")
@@ -59,6 +60,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="DashScope Transcription Proxy", version="0.1.0", lifespan=lifespan)
+
+# WebSocket streaming transcription (OpenAI Realtime dialect) — see realtime.py.
+app.include_router(realtime_router)
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +126,14 @@ async def health():
         "model": s.model,
         "local_mode": s.local_mode,
         "backend": s.backend,
+        "realtime": {
+            "enabled": s.realtime_enabled,
+            "model": s.realtime_model,
+            "input_format": s.realtime_input_format,
+            "sample_rate": s.realtime_sample_rate,
+            "vad": s.realtime_vad,
+            "upstream": "mock" if s.local_mode else (s.realtime_ws_url or derive_realtime_ws_url(s.base_http_api_url)),
+        },
     }
     if s.backend.strip().lower() == "vllm":
         # On the local backend the effective model is vllm_model, not the DashScope id.
